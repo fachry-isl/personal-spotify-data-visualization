@@ -1,0 +1,409 @@
+---
+title: "Spotify Data Visualization"
+author: "Fachry Ikhsal"
+date: '2022-07-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Getting Started
+### Prepare Packages
+```{r load packages,include=FALSE}
+require(xfun)
+
+# List of packages
+packages <- c('tidyverse', # for data importing and wrangling
+              'lubridate', # for date functions
+              'ggplot2', # for visualization
+              'rjson', # for load JSON data
+              'httr' # for http request or API call in R
+              )
+xfun::pkg_attach2(packages, message = FALSE)
+```
+### Prepare Data
+```{r}
+# Read json and convert it to list
+read_stream0 <- fromJSON(file = "./data/StreamingHistory0.json")
+read_stream1 <- fromJSON(file = "./data/StreamingHistory1.json")
+read_stream2 <- fromJSON(file = "./data/StreamingHistory2.json")
+read_stream3 <- fromJSON(file = "./data/StreamingHistory3.json")
+read_library <- fromJSON(file = "./data/YourLibrary.json") 
+read_playlist <- fromJSON(file = "./data/Playlist1.json")
+
+
+# Convert list to data frame
+df_stream0 <- bind_rows(read_stream0)
+df_stream1 <- bind_rows(read_stream1)
+df_stream2 <- bind_rows(read_stream2)
+df_stream3 <- bind_rows(read_stream3)
+df_library <- bind_rows(read_library)
+df_playlist <- bind_rows(read_playlist)
+```
+
+Check Number of Rows of streams
+```{r}
+nrow(df_stream0)
+nrow(df_stream1)
+nrow(df_stream2)
+nrow(df_stream3)
+```
+
+```{r}
+nrow(df_playlist)
+```
+
+#### Merge Streams Data
+```{r, Merge Streams Data}
+df_streams <- bind_rows(df_stream0, df_stream1, df_stream2, df_stream3)
+```
+
+#### Get track_uri
+Next I wanna get track uri as it will be used later to request track genre
+```{r}
+df_playlist_inner <- df_playlist["items"]
+
+# df_playlist_inner_one[1]$items[[1]]$track$trackName
+
+track_uri_list <- list()
+# get track name and track uri
+for(i in 1:nrow(df_playlist_inner)){
+  sub_list <- list(c(trackName = df_playlist_inner[i, 1]$items[[1]]$track$trackName, 
+                   trackUri = df_playlist_inner[i, 1]$items[[1]]$track$trackUri))
+  
+  track_uri_list <- append(track_uri_list, sub_list)
+}
+
+#convert track_uri_list to data frame
+df_track_uri <- bind_rows(track_uri_list)
+```
+check df_track_uri
+```{r}
+str(df_track_uri)
+```
+Now that we have track uri we can get the genres. 
+
+
+Now let's merge the df_streams with df_track_uri with left join using trackNames as reference, we'll store it inside df_stream_with_uri variable's
+```{r eval=FALSE, include=FALSE}
+df_stream_with_uri <- left_join(x=df_streams, y=df_track_uri, by=trackName)
+```
+
+
+Next, I planned to create one year period recap from June 2021 - June 2022, so we need to **filter** the data to only contains data from that time ranges. 
+```{r}
+# Filter it and store it in df_streams_2021
+df_ayear <- df_streams %>%
+  filter(endTime >= as.Date("2021-07-16"), endTime <= as.Date("2022-07-16"))
+```
+
+Let's clean our data from the duplicate entry
+```{r eval=FALSE, include=FALSE}
+df_clean_duplicate <- df_ayear %>%
+  distinct(endTime, .keep_all = TRUE)
+```
+
+
+Another thing, is that we need to make a new columns called month and day, this will come handy later when we visualize it in tableau
+```{r}
+df_streams_year_mutate_sep <- df_ayear %>%
+  mutate(hour = hour(endTime), weekday = wday(endTime, label=TRUE), month = month(endTime))
+```
+
+Next, I planned to add genre, but based on API doc we need track:URI or resource identifier to access the genre associated with the track, the problem is that spotify data that we get doesn't come with the track:URI so weed to get it ourself with some api calls :)
+```{r}
+# required for Authorization
+CLIENT_ID = 'YOUR_CLIENT_ID'
+CLIENT_SECRET = 'YOUR_CLIENT_SECRET'
+
+# To access the APi we need to get the access token first
+AUTH_URL <- "https://accounts.spotify.com/api/token"
+
+#POST
+auth_response <- POST(url = AUTH_URL, 
+                      accept_json(),
+                      authenticate(CLIENT_ID, CLIENT_SECRET),
+                      body = list("grant_type" = "client_credentials"),
+                      encode = 'form',
+                      verbose()
+)
+
+# Get response content specifically the access token
+access_token = content(auth_response)$access_token
+
+# for future API request we need to Bearer our token
+bearer_token = paste('Bearer ', access_token)
+```
+Now, I want to request Track URI for each of my tracks
+```{r}
+# We start by creating the base url
+BASE_URL = 'https://api.spotify.com/v1/'
+sample_track = df_streams_year_mutate_sep$trackName[1]
+search_url = paste0(BASE_URL, "search/")
+```
+
+Let's try one call of api
+```{r}
+track_response = GET(url= search_url, add_headers(Authorization = bearer_token), query = list(q = sample_track, type = "track"))
+
+track_uri = content(track_response)$tracks$items[[1]]$uri
+print(track_uri)
+```
+Before going further I want to make sure my trackName doesn't duplicate because it can lead to multiple api calls on the same trackName, and another thing is that we need to add artist with the trackname because one trackname can be associated with more than one different song but we can identify it if we know the artist name for that song. so first we need to add new column called trackWithArtist in our main data frame
+
+```{r}
+df_streams_mutate_trackwithArtist <- df_streams_year_mutate_sep %>%
+  mutate(trackwithArtist = paste(artistName, trackName))
+```
+
+and use trackWithArtist column for API call using search end point to find trackUri
+```{r}
+df_trackName_artistName <- df_streams_mutate_trackwithArtist %>%
+  distinct(trackwithArtist, .keep_all = TRUE) %>%
+  select(trackwithArtist)
+```
+
+Now let's get trackUri for each of our tracks based on trackwithArtist Field
+```{r}
+# prepare a list to store our trackUri
+# ~1000 data per variable out of 6153 data
+track_name_uri_list_v2 = list()
+# iterate over the streams data, make API call based on each track name and and append the track uri
+# iteration source: df_trackName_artistName
+for(i in 1:nrow(df_trackName_artistName)){
+  # get the track name
+  track_name = df_trackName_artistName$trackwithArtist[i]
+  Sys.sleep(0.05)
+  # create API request and store it in track_response
+  track_response = GET(url= track_url, add_headers(Authorization = bearer_token), query = list(q = track_name, type = "track"))
+  # using tryCatch to handle null content that potentially generate errors
+  track_uri <- tryCatch({content(track_response)$tracks$items[[1]]$uri},
+                       error = function(err){
+                         print(paste("ERROR: ", err))
+                         track_uri <- NULL
+                       })
+  
+  #make a list of trackName and the trackUri
+  sub_list <- list(c(trackwithArtist = track_name, 
+                   trackUri = track_uri))
+  
+  track_name_uri_list_v2 <- append(track_name_uri_list_v2, sub_list)
+  progress = paste("Load trackUri: ", i, " Out of ", nrow(df_trackName_artistName))
+  print(progress)
+}
+```
+
+convert the list to a data frame
+```{r}
+df_track_with_uri <- bind_rows(track_name_uri_list_v2)
+```
+
+Check empty entries on trackUri before left join
+```{r}
+df_streams_track_uri_na_beforejoin <- df_track_with_uri %>%
+  filter(is.na(trackUri) == TRUE) %>%
+  select(trackName, trackUri)
+```
+
+Merge with Left Join
+```{r}
+df_streams_track_uri <- left_join(x=df_streams_mutate_trackwithArtist, y=df_track_with_uri, by="trackwithArtist")
+```
+
+Check empty entries on trackUri after left join. In my case there are 40 entries that contain empties trackUri before join and 117 after, this make sense because there are multiple entries that has the same trackName for one trackUri.
+```{r}
+df_streams_track_uri_na <- df_streams_track_uri %>%
+  filter(is.na(trackUri) == TRUE) %>%
+  select(endTime, trackName, trackUri)
+```
+
+Save for backup
+```{r}
+write.csv(df_streams_track_uri, "./data/Spotify_Main2.csv")
+```
+
+to get the genres we need to access API through artist/trackUri end point.
+Let's try one call of api
+```{r}
+# construct a new endpoint
+# get genres via artist endpoint
+tracks_url <- paste0(BASE_URL, "tracks/")
+sample_uri <- df_streams_track_uri$trackUri[1]
+track_id <- strsplit(sample_uri, split = ":")[[1]][3]
+stonebank_id <- "6HCmuewveUWxu30HSCsWk5"
+tracks_request_url <- paste0(tracks_url, stonebank_id)
+print(tracks_request_url)
+```
+
+```{r warning=FALSE}
+# from this we can get artist and album associated with the track
+tracks_response <- GET(url= tracks_request_url, add_headers(Authorization = bearer_token))
+
+tracks_content = content(tracks_response)
+
+artist_uri <- tracks_content$artists[[1]]$uri
+artist_id <- tracks_content$artists[[1]]$id
+
+artist_request_url <- paste0(BASE_URL, "artists/", artist_id)
+print(artist_request_url)
+artist_response <- GET(url = artist_request_url, add_headers(Authorization = bearer_token))
+print(artist_response$status_code)
+artist_content <- content(artist_response)
+View(artist_content)
+```
+```{r}
+stonebank_content <- artist_content
+stone_trackUri <- paste0("spotify:track:", stonebank_id)
+stone_artistUri <- stonebank_content$uri
+stone_genres <- stonebank_content$genres
+stone_subList <- list(c(trackUri = stone_trackUri,
+                     artistUri = stone_artistUri,
+                     artistGenres = list(stone_genres)))
+```
+
+again we use distinct to minimize the amount of api calls
+```{r}
+df_track_uri_distinct <- df_streams_track_uri %>%
+  distinct(trackUri, .keep_all = TRUE) %>%
+  select(trackUri)
+```
+
+### [API] Get Album name and Genres for each track with trackUri
+```{r}
+# create a new list
+list_streams_track_uri_genres_albumV4 = list()
+# source: df_track_uri_distinct
+for(i in 1:nrow(df_track_uri_distinct)){
+  Sys.sleep(0.05)
+  # get trackId from trackUri for request
+  trackUri <- df_track_uri_distinct$trackUri[i]
+  # get trackId by getting the last part of trackUri using split
+  trackId <- strsplit(trackUri, split=":")[[1]][3]
+  # construct tracksUrl with trackId
+  tracks_request_url <- paste0(tracks_url, trackId)
+  # with this request we'll get artistUri
+  tracks_response <- GET(url = tracks_request_url, add_headers(Authorization = bearer_token))
+  # get artistId for further request, for getting genres
+  artist_id <- tryCatch({content(tracks_response)[["album"]][["artists"]][[1]][["id"]]},
+                        error = function(err){
+                        print(paste("ERROR: ", err))
+                       })
+  albumName <- tryCatch({content(tracks_response)[["album"]][["name"]]},
+                        error = function(err){
+                        print(paste("ERROR: ", err))
+                       })
+  albumUri <- tryCatch({content(tracks_response)[["album"]][["uri"]]},
+                        error = function(err){
+                        print(paste("ERROR: ", err))
+                       })
+  
+  artist_request_url <- paste0(BASE_URL, "artists/", artist_id)
+  # with this request we'll get the genres of each artist
+  artist_response <- GET(url = artist_request_url, add_headers(Authorization = bearer_token))
+  # get genres from artist response
+  artist_genres <- tryCatch({content(artist_response)[["genres"]]},
+                            error = function(err){
+                              print(paste("ERROR: ", err))
+                            })
+  sub_list <- list(c(albumName = albumName,
+                     albumUri = albumUri,
+                     trackUri = trackUri,
+                     artistUri = content(tracks_response)$artists[[1]]$uri,
+                     artistGenres = list(artist_genres)))
+  
+  list_streams_track_uri_genres_albumV4 <- append(list_streams_track_uri_genres_albumV4, sub_list)
+  
+  # debug progress
+  progress = paste("Load artistGenres: ", i, " Out of ", nrow(df_track_uri_distinct))
+  print(progress)
+}
+```
+
+
+```{r}
+df_streams_track_uri_genresV2_stone <- append(df_streams_track_uri_genresV2, stone_subList)
+```
+
+
+```{r}
+# convert list to a dataframe
+df_streamsv4_artistUri_genres_album <- bind_rows(list_streams_track_uri_genres_albumV4)
+```
+
+```{r}
+df_streamsv4_artistUri_genres_album_sep <- df_streamsv4_artistUri_genres_album %>% separate_rows(artistGenres, sep=",")
+```
+
+```{r}
+write.csv(df_streamsv4_artistUri_genres_album_sep, "./data/Spotify_Genres_Album.csv")
+```
+
+##
+
+left_join to the actual streams data
+```{r}
+df_streams_genres_join <- left_join(df_streams_track_uri, df_streams_genres, by=)
+View(df_streams_genres_join)
+```
+
+
+```{r}
+df_test <- df_streams_genres %>%
+  count(artistGenres, name = "amountGenres") %>%
+  filter(amountGenres > 200)
+View(df_test)
+```
+
+```{r}
+df_testggplot <- df_test1 %>%
+  count(artistGenres, name = "amountGenres") %>%
+  top_n(n = 20, wt = amountGenres) %>%
+  arrange(desc(amountGenres))
+```
+
+```{r}
+ggplot(data = df_testggplot) + geom_col(mapping=aes(x=fct_rev(fct_reorder(as.character(artistGenres), amountGenres)), y=amountGenres)) + xlab("Genre") + ylab("Total Genre") + theme(axis.text.x = element_text(angle = 45, size = 10))
+```
+
+Fix issue of duplicate trackUri on the same trackName associated with different artist, in this case track name called **Stronger** came from two different artist Kanye west and Stone bank. after my inspection Stone bank has the wrong trackUri
+```{r}
+df_inspect <- df_streams_track_uri %>%
+  filter(trackName == "Stronger", artistName == "Stonebank")
+View(df_inspect)
+```
+
+```{r}
+df_test <- df_streams_track_uri %>%
+  filter(trackName == "Stronger")
+View(df_test)
+```
+
+
+Now let's replace it with the right trackUri, You can get the uri from song link in the Spotify app.
+```{r}
+# df_streams_track_uri_fix_stone <- df_streams_track_uri %>%
+#   filter(trackName == "Stronger", artistName == "Stonebank") %>%
+#   mutate(trackUri = "spotify:track:6HCmuewveUWxu30HSCsWk5")
+
+df_streams_track_uri$trackUri[df_streams_track_uri$trackName == "Stronger" & df_streams_track_uri$artistName == "Stonebank"] <- "spotify:track:6HCmuewveUWxu30HSCsWk5"
+```
+
+```{r}
+df_test <- df_streams_track_uri %>%
+  filter(trackName == "Stronger", artistName == "Stonebank")
+print(nrow(df_test))
+View(df_test)
+```
+
+
+```{r}
+ggplot(data = df_streams) + geom_col(mapping=aes(x=fct_rev(fct_reorder(as.character(artistGenres), amountGenres)), y=amountGenres)) + xlab("Genre") + ylab("Total Genre") + theme(axis.text.x = element_text(angle = 45, size = 10))
+```
+
+
+
+
+
+
